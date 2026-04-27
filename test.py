@@ -1,71 +1,90 @@
 import torch
 import os
+import matplotlib.pyplot as plt
+import numpy as np
 
 
-def test_serialized_model(serialized_model_path, device='cpu'):
-    print(f"--- Testing Serialized Model on {device.upper()} ---")
+# Optional: If you have display issues on Linux/Mac, uncomment the line below
+# import matplotlib
+# matplotlib.use("TkAgg")
 
-    # 1. Verify the file exists
+def test_and_visualize_model(serialized_model_path, device='cpu'):
+    print(f"--- Visualizing Serialized Model on {device.upper()} ---")
+
     if not os.path.exists(serialized_model_path):
         print(f"Error: Could not find '{serialized_model_path}'.")
-        print("Please run the serialization script first to generate the .pt file.")
         return
 
-    # =========================================================================
-    # THE MAGIC: We are loading the model without importing any network classes!
-    # =========================================================================
-    print(f"\n1. Loading the TorchScript model from {serialized_model_path}...")
-    try:
-        loaded_model = torch.jit.load(serialized_model_path, map_location=device)
-        loaded_model.eval()
-        print("   ✅ Model loaded successfully!")
-    except Exception as e:
-        print(f"   ❌ Failed to load model. Error: {e}")
-        return
+    # 1. Load the model
+    print(f"1. Loading the TorchScript model...")
+    loaded_model = torch.jit.load(serialized_model_path, map_location=device)
+    loaded_model.eval()
 
-    # 2. Create Dummy Data matching your architecture (Batch=1, Channels=12, Time=400)
-    print("\n2. Generating dummy input data (1, 12, 400)...")
-    dummy_input = torch.randn(1, 12, 400).to(device)
+    # 2. Generate Dummy 12-Lead Data
+    print("2. Generating simulated 12-lead ECG data...")
+    # Adding a sine wave to the random noise so the plot looks like a continuous signal
+    time_steps = np.linspace(0, 4 * np.pi, 400)
+    dummy_numpy = np.random.randn(12, 400) * 0.1 + np.sin(time_steps)
+    dummy_input = torch.tensor(dummy_numpy, dtype=torch.float32).unsqueeze(0).to(device)
 
     # 3. Run Inference
-    print("\n3. Running inference...")
-    try:
-        with torch.no_grad():
-            raw_logits = loaded_model(dummy_input)
+    print("3. Running inference...")
+    with torch.no_grad():
+        binary_predictions = loaded_model(dummy_input)
+        print(binary_predictions)
 
-            # Apply your multi-label threshold (Logit > 0 equals Probability > 0.5)
-            binary_predictions = (raw_logits > 0.0).int()
+    # Extract the specific class IDs that were predicted as '1' (Positive)
+    # binary_predictions[0] accesses the first item in the batch
+    predicted_classes = torch.where(binary_predictions[0] == 1)[0].tolist()
 
-        print("   ✅ Inference successful!")
-    except Exception as e:
-        print(f"   ❌ Inference failed. Error: {e}")
-        return
+    print(f"\n--- Results ---")
+    print(f"Total Positive Triggers: {len(predicted_classes)}")
+    print(f"Detected Class IDs: {predicted_classes}")
 
-    # 4. Display Results
-    print("\n4. Network Architecture Verification:")
-    print(f"   Input shape:  {dummy_input.shape}  -> Expected: [1, 12, 400]")
-    print(f"   Output shape: {raw_logits.shape} -> Expected: [1, 1000]")
+    # 4. Generate Visualization
+    print("\n4. Generating Visualization Plot...")
 
-    print(f"\n   First 20 class predictions (0 or 1):")
-    print(f"   {binary_predictions[0, :100].tolist()}")
+    # Create a 12-row plot for the 12 leads
+    fig, axes = plt.subplots(nrows=12, ncols=1, figsize=(10, 14), sharex=True)
+    fig.suptitle('InceptionTime Model: 12-Lead Input & Predictions', fontsize=16, fontweight='bold', y=0.98)
 
-    print("\n🎉 Serialization Test Fully Passed! The model is ready for deployment.")
+    # Plot each lead
+    for i in range(12):
+        axes[i].plot(dummy_input[0, i, :].cpu().numpy(), color='#1f77b4', linewidth=1.2)
+        axes[i].set_ylabel(f'Lead {i + 1}', rotation=0, labelpad=30, va='center', fontweight='bold')
+        axes[i].grid(True, linestyle='--', alpha=0.5)
+        axes[i].spines['top'].set_visible(False)
+        axes[i].spines['right'].set_visible(False)
 
-    # Optional: Extracting the metadata we saved using _extra_files
-    print("\n--- Testing Metadata Extraction ---")
-    extra_files = {'version': '', 'model_filename_to_use': ''}
-    torch.jit.load(serialized_model_path, map_location=device, _extra_files=extra_files)
+    axes[-1].set_xlabel('Time Steps (400)', fontweight='bold', fontsize=12)
 
-    print(f"   Embedded Version: {extra_files['version'].decode('utf-8')}")
-    print(f"   Source Weights:   {extra_files['model_filename_to_use'].decode('utf-8')}")
+    # Add a highlighted text box at the top with the prediction results
+    result_text = "Model Outputs (Triggered Classes):\n"
+    if not predicted_classes:
+        result_text += "None (All classes output 0)"
+    else:
+        # Wrap text if the model triggers too many classes to fit on one line
+        import textwrap
+        class_str = ", ".join(map(str, predicted_classes))
+        result_text += textwrap.fill(class_str, width=80)
+
+    plt.figtext(0.5, 0.94, result_text, ha="center", fontsize=11,
+                bbox={"facecolor": "#d4edda", "edgecolor": "#c3e6cb", "alpha": 0.8, "pad": 8,
+                      "boxstyle": "round,pad=0.5"})
+
+    plt.tight_layout(rect=[0, 0, 1, 0.92])  # Leave room for the title and text box
+
+    # Save and Show
+    output_image = "visualized_inference_test.png"
+    plt.savefig(output_image, dpi=150)
+    print(f"Visualization successfully saved to '{output_image}'")
+    plt.show()
 
 
 if __name__ == '__main__':
-    # Determine the device automatically
     target_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Path to the output of your previous script
-    # Update this string if you named your folder or file differently
+    # Update this path if necessary to point to your final serialized wrapper
     model_path = f'./serialized_models_{target_device}/serialized_inception_time_model.pt'
 
-    test_serialized_model(model_path, target_device)
+    test_and_visualize_model(model_path, target_device)
