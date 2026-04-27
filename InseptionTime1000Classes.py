@@ -284,12 +284,12 @@ if __name__ == '__main__':
     # Training Loop (Optional - uncomment below to train the mock setup)
     # =========================================================================
 
-    # criterion = nn.BCEWithLogitsLoss() # Changed for Multi-label classification (0 or 1)
-    # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.BCEWithLogitsLoss() # Changed for Multi-label classification (0 or 1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    # total_train_loss, total_train_acc, total_val_loss, total_val_acc = train_model(
-    #     model, train_loader, val_loader, criterion, optimizer, device, num_epochs=2, patience=50
-    # )
+    total_train_loss, total_train_acc, total_val_loss, total_val_acc = train_model(
+         model, train_loader, val_loader, criterion, optimizer, device, num_epochs=10, patience=100
+     )
 
-    # plot_metric(total_train_acc, total_val_acc, "Accuracy")
-    # plot_metric(total_train_loss, total_val_loss, "Loss")
+    plot_metric(total_train_acc, total_val_acc, "Accuracy")
+    plot_metric(total_train_loss, total_val_loss, "Loss")
