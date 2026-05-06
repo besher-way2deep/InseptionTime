@@ -271,6 +271,16 @@ def process_one(mat_path: Path, fs: float, window_ms: float, out_dir: Path) -> d
         info['signal_12ch'], info['woi_start'], info['woi_end'], fs, window_ms,
     )
 
+    # If PaSo gave us a WOI, translate file-coords → window-coords and pass it
+    # to the localizer so it skips its own QRS detector (which is unreliable
+    # on noisy strips).
+    qrs_window = None
+    if info['woi_start'] is not None and info['woi_end'] is not None:
+        ws = max(0, info['woi_start'] - win_start)
+        we = min(window.shape[0] - 1, info['woi_end'] - win_start)
+        if 0 <= ws < we < window.shape[0]:
+            qrs_window = (ws, (ws + we) // 2, we)
+
     png_path = out_dir / f"{stem}_localization.png"
     raw_png_path = out_dir / f"{stem}_raw.png"
 
@@ -281,6 +291,7 @@ def process_one(mat_path: Path, fs: float, window_ms: float, out_dir: Path) -> d
 
     result = localize_pvc_12lead(
         window, fs=fs, visualize=True, output_path=str(png_path),
+        qrs_window=qrs_window,
     )
 
     qrs_dur = None

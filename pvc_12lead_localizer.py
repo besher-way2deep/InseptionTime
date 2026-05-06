@@ -98,28 +98,39 @@ class LocalizationResult:
 def detect_qrs_window_multilead(
     signal_12ch: np.ndarray,
     fs: float,
+    threshold_frac: float = 0.35,
+    max_half_width_ms: float = 150.0,
 ) -> Tuple[int, int, int]:
     """
     QRS happens at the SAME time in all 12 leads (single dipole, multiple
-    projections). So we sum the magnitudes across leads to get a robust
-    QRS detection window, then walk outward to find boundaries.
+    projections). Sum |signal| across leads and walk outward from the peak
+    until the energy drops below `threshold_frac` of peak.
 
-    Returns indices (onset, peak, offset) along the time axis.
+    Two safeguards keep the window from running into the T-wave when the
+    surrounding signal isn't quiet:
+      - threshold_frac default 0.35 (was 0.15 — too lenient for noisy strips)
+      - max_half_width_ms hard-caps the walk on each side
+        (PVC QRS is typically 120-200 ms; 150 ms each side = 300 ms max)
+
+    Returns sample indices (onset, peak, offset).
     """
-    # Combined energy: sum of absolute values across all 12 leads
     baselines = np.median(signal_12ch, axis=0)
     centered = signal_12ch - baselines
     combined = np.sum(np.abs(centered), axis=1)
 
     peak_idx = int(np.argmax(combined))
     peak_val = combined[peak_idx]
-    threshold = 0.15 * peak_val
+    threshold = threshold_frac * peak_val
+
+    max_half = int(round(max_half_width_ms * fs / 1000.0))
+    left_limit = max(0, peak_idx - max_half)
+    right_limit = min(len(combined) - 1, peak_idx + max_half)
 
     onset_idx = peak_idx
-    while onset_idx > 0 and combined[onset_idx] > threshold:
+    while onset_idx > left_limit and combined[onset_idx] > threshold:
         onset_idx -= 1
     offset_idx = peak_idx
-    while offset_idx < len(combined) - 1 and combined[offset_idx] > threshold:
+    while offset_idx < right_limit and combined[offset_idx] > threshold:
         offset_idx += 1
 
     return onset_idx, peak_idx, offset_idx
@@ -441,6 +452,7 @@ def localize_pvc_12lead(
     fs: float,
     visualize: bool = True,
     output_path: str = '12lead_localization.png',
+    qrs_window: Optional[Tuple[int, int, int]] = None,
 ) -> LocalizationResult:
     """
     Localize a PVC origin from a 12-lead ECG signal.
@@ -451,6 +463,10 @@ def localize_pvc_12lead(
       fs:          sampling frequency in Hz
       visualize:   render a 12-panel diagnostic figure
       output_path: where to save the figure
+      qrs_window:  optional (onset, peak, offset) sample indices. If supplied
+                   (e.g., from PaSo's WOI), skip auto-detection and use these
+                   bounds for feature extraction. Trust externally-segmented
+                   QRS over the multi-lead energy heuristic.
 
     Returns: LocalizationResult with probabilities, most_likely, sub-loc, reasoning.
     """
@@ -458,8 +474,11 @@ def localize_pvc_12lead(
         raise ValueError(f"Expected 12 channels, got {signal_12ch.shape[1]}. "
                          f"Channel order: {LEAD_ORDER}")
 
-    # Step 1: Synchronized QRS detection
-    onset, peak, offset = detect_qrs_window_multilead(signal_12ch, fs)
+    # Step 1: QRS window — trust externally-supplied bounds if present
+    if qrs_window is not None:
+        onset, peak, offset = qrs_window
+    else:
+        onset, peak, offset = detect_qrs_window_multilead(signal_12ch, fs)
 
     # Step 2: Per-lead features
     lead_feats = []
