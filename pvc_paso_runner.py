@@ -25,14 +25,90 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import scipy.io as sio
 
 from pvc_12lead_localizer import (
+    LEAD_INDEX,
     LEAD_ORDER,
     detect_qrs_window_multilead,
     localize_pvc_12lead,
 )
+
+
+# ─────────────────────────────────────────────────────────────────
+# RAW (B&W, no interpretation) 12-LEAD PLOT
+# ─────────────────────────────────────────────────────────────────
+def plot_raw_clinical_12lead(
+    signal_12ch: np.ndarray,
+    fs: float,
+    output_path: Path,
+    title: str = "",
+) -> None:
+    """
+    Render the 400 ms window as a clean clinical-style 12-lead grid:
+    white background, black traces, no annotations or probabilities.
+
+    Layout (standard clinical):
+        Row 1: I    aVR  V1  V4
+        Row 2: II   aVL  V2  V5
+        Row 3: III  aVF  V3  V6
+    """
+    layout = [
+        ['I',   'aVR', 'V1', 'V4'],
+        ['II',  'aVL', 'V2', 'V5'],
+        ['III', 'aVF', 'V3', 'V6'],
+    ]
+    t_ms = np.arange(signal_12ch.shape[0]) * 1000.0 / fs
+
+    # Common y-range so leads are visually comparable.
+    y_max = float(np.max(np.abs(signal_12ch))) * 1.1
+    if y_max == 0:
+        y_max = 1.0
+
+    fig, axes = plt.subplots(3, 4, figsize=(14, 8), facecolor='white',
+                              sharex=True, sharey=True)
+    if title:
+        fig.suptitle(title, fontsize=13, color='black', y=0.97)
+
+    for r in range(3):
+        for c in range(4):
+            ax = axes[r, c]
+            lead_name = layout[r][c]
+            ch = LEAD_INDEX[lead_name]
+
+            ax.set_facecolor('white')
+            # Light ECG-paper style grid (every 40 ms)
+            for x in np.arange(0, t_ms[-1] + 1, 40):
+                ax.axvline(x, color='#f0c0c0', linewidth=0.4)
+            for y in np.arange(-y_max, y_max, y_max / 4):
+                ax.axhline(y, color='#f0c0c0', linewidth=0.4)
+
+            ax.plot(t_ms, signal_12ch[:, ch], color='black', linewidth=1.2)
+            ax.axhline(0, color='#888888', linewidth=0.4)
+
+            ax.text(0.02, 0.92, lead_name, transform=ax.transAxes,
+                    fontsize=11, fontweight='bold', color='black',
+                    va='top', ha='left')
+
+            ax.set_ylim(-y_max, y_max)
+            ax.set_xlim(0, t_ms[-1])
+            for sp in ax.spines.values():
+                sp.set_color('#888888')
+                sp.set_linewidth(0.6)
+            ax.tick_params(colors='#888888', labelsize=8)
+            if r < 2:
+                ax.set_xticklabels([])
+            if c > 0:
+                ax.set_yticklabels([])
+
+    for c in range(4):
+        axes[2, c].set_xlabel('Time (ms)', fontsize=9, color='#444444')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(output_path, dpi=140, facecolor='white', bbox_inches='tight')
+    plt.close(fig)
 
 # ─────────────────────────────────────────────────────────────────
 # CONFIG
@@ -196,6 +272,13 @@ def process_one(mat_path: Path, fs: float, window_ms: float, out_dir: Path) -> d
     )
 
     png_path = out_dir / f"{stem}_localization.png"
+    raw_png_path = out_dir / f"{stem}_raw.png"
+
+    plot_raw_clinical_12lead(
+        window, fs=fs, output_path=raw_png_path,
+        title=f"{stem} — 400 ms window (raw 12-lead, no interpretation)",
+    )
+
     result = localize_pvc_12lead(
         window, fs=fs, visualize=True, output_path=str(png_path),
     )
@@ -225,6 +308,7 @@ def process_one(mat_path: Path, fs: float, window_ms: float, out_dir: Path) -> d
         "v2_transition_ratio": result.cross_features.v2_transition_ratio,
         "v2s_v3r_index": result.cross_features.v2s_v3r_index,
         "png": str(png_path),
+        "raw_png": str(raw_png_path),
     }
 
 
