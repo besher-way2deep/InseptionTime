@@ -1,3 +1,10 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Local Claude Code settings
+.claude/
+
+# Generated localization outputs
+paso_localization_output/
+paso_local_copy/
