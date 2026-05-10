@@ -70,13 +70,16 @@ class LeadFeatures:
 @dataclass
 class CrossLeadFeatures:
     """Features that span multiple leads — these are the most diagnostic."""
-    frontal_axis_deg: float = 0.0    # computed from I and aVF
-    precordial_transition: int = 4   # lead # (1-6) where R first ≥ S
-    v2_transition_ratio: float = 0.0 # R/(R+S) in V2
-    v2s_v3r_index: float = 0.0       # |S in V2| / R in V3
-    inferior_axis_score: float = 0.0 # +1 = clearly inferior, -1 = clearly superior
-    v2_pattern_break: bool = False   # LV summit signature
-    qrs_duration_ms: float = 0.0     # max across leads
+    frontal_axis_deg: float = 0.0                # computed from I and aVF
+    precordial_transition: int = 4               # lead # (1-6) where R first ≥ S
+    v2_transition_ratio: float = 0.0             # raw R/(R+S) in V2 during PVC
+    v2_transition_ratio_normalized: float = 0.0  # Betensky: PVC/sinus (0 = no sinus ref)
+    tz_index: float = 0.0                        # Yoshida: PVC TZ − sinus TZ (0 = no sinus ref)
+    v2s_v3r_index: float = 0.0                   # |S in V2| / R in V3
+    inferior_axis_score: float = 0.0             # +1 = clearly inferior, -1 = clearly superior
+    v2_pattern_break: bool = False               # LV summit signature
+    v1_pattern: str = 'unknown'                  # QS|rS|LBBB-like|transitional|M/W|qrS|dominant-R|narrow-RBBB
+    qrs_duration_ms: float = 0.0                 # max across leads
 
 
 @dataclass
@@ -85,8 +88,12 @@ class LocalizationResult:
     probabilities: Dict[str, float] = field(default_factory=dict)
     most_likely: str = ''
     confidence: float = 0.0
-    sub_localization: str = ''       # finer guess (e.g., "RVOT septal")
+    sub_localization: str = ''        # finer guess (e.g., "RVOT septal")
     is_epicardial: bool = False
+    epi_marker_count: int = 0         # how many of 3 epicardial markers triggered
+    avg_mdi: float = 0.0              # mean MDI across V1–V3 (Daniels 2006)
+    avg_pseudo_delta_ms: float = 0.0  # mean pseudo-delta across V1–V3 (Berruezo 2004)
+    intrinsicoid_v2_ms: float = 0.0   # QRS onset to V2 peak (Berruezo 2004)
     reasoning: List[str] = field(default_factory=list)
     lead_features: List[LeadFeatures] = field(default_factory=list)
     cross_features: Optional[CrossLeadFeatures] = None
@@ -213,48 +220,172 @@ def extract_lead_features(
 
 
 # ─────────────────────────────────────────────────────────────────
+# STEP 2b: V1 MORPHOLOGY PATTERN CLASSIFICATION
+# ─────────────────────────────────────────────────────────────────
+def classify_v1_pattern(
+    v1_signal: np.ndarray,
+    onset_idx: int,
+    offset_idx: int,
+    fs: float,
+) -> str:
+    """
+    Classify the V1 QRS into named clinical morphology types used in the
+    Pattern Atlas (PDF steps 11–16).
+
+    Returns one of:
+      'QS'          — monophasic negative, no R wave
+      'rS'          — small R then dominant S (classic LBBB-like, RVOT)
+      'LBBB-like'   — broad dominant negative, less extreme than rS
+      'transitional' — R ≈ S (borderline, septal)
+      'M/W'         — multiphasic ≥3 direction changes (LCC signature)
+      'qrS'         — small q, small r, deep S (L-R commissure signature)
+      'dominant-R'  — dominant R wave (RBBB-like, LV origin)
+      'narrow-RBBB' — dominant R, narrow QRS (fascicular VT)
+      'unknown'     — too short or featureless
+    """
+    qrs = v1_signal[onset_idx:offset_idx + 1]
+    if len(qrs) < 3:
+        return 'unknown'
+
+    pre = v1_signal[max(0, onset_idx - 10):onset_idx]
+    baseline = float(pre.mean()) if len(pre) > 0 else float(qrs[0])
+    qrs_c = qrs - baseline
+
+    if len(qrs_c) >= 7:
+        win = min(11, len(qrs_c))
+        win = win if win % 2 == 1 else win - 1
+        smooth = scipy_signal.savgol_filter(qrs_c, win, 3)
+    else:
+        smooth = qrs_c.copy()
+
+    r_amp = float(np.max(smooth))
+    s_amp = float(np.min(smooth))  # negative value
+    dom = max(abs(r_amp), abs(s_amp))
+    if dom < 1e-6:
+        return 'unknown'
+
+    thresh = 0.10 * dom  # significance threshold: 10% of dominant amplitude
+    qrs_dur_ms = (offset_idx - onset_idx) * 1000.0 / fs
+
+    # --- Segment analysis via sign-change regions ---
+    signs = np.sign(smooth)
+    signs[np.abs(smooth) < thresh] = 0
+    # Forward-fill zeros so crossings are clean
+    for i in range(1, len(signs)):
+        if signs[i] == 0:
+            signs[i] = signs[i - 1]
+    crossings = np.where(np.diff(signs) != 0)[0]
+    boundaries = [0] + list(crossings + 1) + [len(smooth)]
+
+    # Peak amplitude of each contiguous segment
+    segments = []
+    for i in range(len(boundaries) - 1):
+        seg = smooth[boundaries[i]:boundaries[i + 1]]
+        if len(seg) == 0:
+            continue
+        peak_val = float(seg[np.argmax(np.abs(seg))])
+        if abs(peak_val) > thresh:
+            segments.append(peak_val)
+
+    n_seg = len(segments)
+    rs_total = r_amp + abs(s_amp)
+    rs_ratio = r_amp / rs_total if rs_total > 0 else 0.5
+
+    # QS: no meaningful positive component
+    if rs_ratio < 0.05:
+        return 'QS'
+
+    # M/W: 3+ alternating significant segments (e.g. +−+ or −+−+)
+    if n_seg >= 3:
+        alternations = sum(
+            1 for i in range(len(segments) - 1)
+            if segments[i] * segments[i + 1] < 0
+        )
+        if alternations >= 2:
+            return 'M/W'
+
+    # qrS: pattern [neg, pos, neg] where initial neg and middle pos are both
+    # small relative to the terminal dominant S
+    if n_seg >= 2 and segments[0] < -thresh and segments[-1] < -thresh:
+        pos_segs = [s for s in segments if s > thresh]
+        if pos_segs:
+            max_pos = max(pos_segs)
+            first_neg_frac = abs(segments[0]) / abs(s_amp)
+            if max_pos < 0.5 * abs(s_amp) and first_neg_frac < 0.30:
+                return 'qrS'
+
+    # Simple R vs S ratio classification
+    if rs_ratio < 0.20:
+        return 'rS'
+    elif rs_ratio < 0.45:
+        return 'LBBB-like'
+    elif rs_ratio < 0.60:
+        return 'transitional'
+    elif qrs_dur_ms < 135:
+        return 'narrow-RBBB'
+    else:
+        return 'dominant-R'
+
+
+# ─────────────────────────────────────────────────────────────────
 # STEP 3: CROSS-LEAD FEATURE COMPUTATION
 # ─────────────────────────────────────────────────────────────────
-def compute_cross_features(lead_feats: List[LeadFeatures]) -> CrossLeadFeatures:
+def compute_cross_features(
+    lead_feats: List[LeadFeatures],
+    v1_pattern: str = 'unknown',
+    sinus_feats: Optional[List[LeadFeatures]] = None,
+) -> CrossLeadFeatures:
     """Compute features that combine information across leads."""
     f = {lf.name: lf for lf in lead_feats}
     cf = CrossLeadFeatures()
+    cf.v1_pattern = v1_pattern
 
     # ─── Frontal axis from Lead I and aVF amplitudes ───
-    # Net amplitude in each lead = R + S (signed)
     I_amp   = f['I'].r_amp + f['I'].s_amp
     aVF_amp = f['aVF'].r_amp + f['aVF'].s_amp
     cf.frontal_axis_deg = float(np.degrees(np.arctan2(aVF_amp, I_amp)))
 
     # ─── Inferior axis score: positive in II, III, aVF → outflow tract ───
-    # Sum of polarities (+1 for positive dominant, -1 for negative dominant)
     inf_score = 0.0
     for nm in ['II', 'III', 'aVF']:
         if f[nm].polarity == 'positive':
-            inf_score += f[nm].rs_ratio  # higher R/S → more clearly positive
+            inf_score += f[nm].rs_ratio
         else:
             inf_score -= (1.0 - f[nm].rs_ratio)
-    cf.inferior_axis_score = inf_score / 3.0  # normalize to ~[-1, +1]
+    cf.inferior_axis_score = inf_score / 3.0
 
     # ─── Precordial transition zone (lead where R first ≥ S) ───
-    transition = 7  # default if never transitions (>V6)
+    transition = 7  # default: never transitions within V1–V6
     for i, lead in enumerate(['V1', 'V2', 'V3', 'V4', 'V5', 'V6'], start=1):
         if f[lead].rs_ratio >= 0.5:
             transition = i
             break
     cf.precordial_transition = transition
 
-    # ─── V2 transition ratio (Betensky): R/(R+S) in V2 during PVC ───
-    # (Without sinus reference, we use the absolute V2 ratio)
+    # ─── V2 transition ratio raw (Betensky numerator) ───
     cf.v2_transition_ratio = f['V2'].rs_ratio
 
-    # ─── V2S/V3R index (Yoshida) ───
+    # ─── Sinus-reference indices (require a sinus beat window) ───
+    if sinus_feats is not None:
+        sf = {lf.name: lf for lf in sinus_feats}
+        sinus_v2_rs = sf['V2'].rs_ratio
+        # Betensky 2011: PVC R/(R+S) in V2 ÷ sinus R/(R+S) in V2 → ≥0.6 = LVOT
+        if sinus_v2_rs > 0.01:
+            cf.v2_transition_ratio_normalized = cf.v2_transition_ratio / sinus_v2_rs
+        # Yoshida 2011: PVC transition lead − sinus transition lead → <0 = LV side
+        sinus_tz = 7
+        for i, lead in enumerate(['V1', 'V2', 'V3', 'V4', 'V5', 'V6'], start=1):
+            if sf[lead].rs_ratio >= 0.5:
+                sinus_tz = i
+                break
+        cf.tz_index = float(transition - sinus_tz)
+
+    # ─── V2S/V3R index (Yoshida 2014) ───
     s_v2 = abs(f['V2'].s_amp)
     r_v3 = max(f['V3'].r_amp, 0.01)
     cf.v2s_v3r_index = s_v2 / r_v3
 
     # ─── V2 pattern break (LV summit signature) ───
-    # R wave present in V1, drops in V2, returns in V3
     v1_r = f['V1'].r_amp
     v2_r = f['V2'].r_amp
     v3_r = f['V3'].r_amp
@@ -349,7 +480,7 @@ def classify_4regions(
 
     # ═══════ Refinements from quantitative indices ═══════
 
-    # Lead I refinement: positive → boost RV-side; negative → boost LV-side (esp. LV)
+    # Lead I refinement
     if not lead_i_pos:
         p['LV'] *= 1.6
         p['LVOT'] *= 1.2
@@ -358,38 +489,69 @@ def classify_4regions(
         p['RV'] *= 1.1
 
     # Transition zone refinement
-    if tz <= 2:           # early → LV side
+    if tz <= 2:
         p['LVOT'] *= 1.5
         p['LV']   *= 1.3
-    elif tz >= 5:         # late → RV side or posterior
+    elif tz >= 5:
         p['RVOT'] *= 1.3
         p['RV']   *= 1.4
 
-    # V2 transition ratio (Betensky): ≥0.6 → LVOT
-    if cf.v2_transition_ratio >= 0.6:
+    # V2 transition ratio (Betensky 2011): prefer normalized vs sinus when available
+    betensky = (cf.v2_transition_ratio_normalized
+                if cf.v2_transition_ratio_normalized > 0
+                else cf.v2_transition_ratio)
+    if betensky >= 0.6:
         p['LVOT'] *= 2.0
-        reasoning.append(f"V2 transition ratio = {cf.v2_transition_ratio:.2f} ≥ 0.6 → LVOT boost")
+        src = 'normalized' if cf.v2_transition_ratio_normalized > 0 else 'raw'
+        reasoning.append(f"V2 transition ratio ({src}) = {betensky:.2f} ≥ 0.6 → LVOT boost")
 
-    # V2S/V3R index (Yoshida): ≤1.5 → LVOT
+    # Yoshida TZ index (2011): <0 means PVC transition earlier than sinus → LV side
+    if cf.tz_index < 0:
+        p['LVOT'] *= 1.4
+        p['LV']   *= 1.2
+        reasoning.append(
+            f"TZ index = {cf.tz_index:+.0f} (PVC transition earlier than sinus) → LV-side lean"
+        )
+
+    # V2S/V3R index (Yoshida 2014): ≤1.5 → LVOT
     if cf.v2s_v3r_index <= 1.5 and f['V3'].r_amp > 0.1:
         p['LVOT'] *= 1.5
         reasoning.append(f"V2S/V3R = {cf.v2s_v3r_index:.2f} ≤ 1.5 → LVOT boost")
 
-    # Epicardial markers (MDI, pseudo-delta) → boost LV (LV summit common epi)
+    # V1 pattern refinements (Pattern Atlas, PDF steps 11–16)
+    if cf.v1_pattern == 'M/W':
+        p['LVOT'] *= 1.8
+        reasoning.append("V1 M/W multiphasic pattern → LCC boost")
+    elif cf.v1_pattern == 'qrS':
+        p['LVOT'] *= 1.5
+        reasoning.append("V1 qrS pattern → L-R commissure boost")
+    elif cf.v1_pattern in ('QS', 'rS'):
+        p['RVOT'] *= 1.2
+        p['RV']   *= 1.1
+    elif cf.v1_pattern == 'narrow-RBBB':
+        p['LV'] *= 1.5
+        reasoning.append("V1 narrow-RBBB → fascicular signature → LV boost")
+
+    # Epicardial markers: MDI (Daniels 2006), pseudo-delta + intrinsicoid V2 (Berruezo 2004)
     is_epicardial = False
     epi_markers = 0
     avg_mdi = np.mean([f[ld].mdi for ld in ['V1', 'V2', 'V3']])
     avg_pseudo = np.mean([f[ld].pseudo_delta_ms for ld in ['V1', 'V2', 'V3']])
+    intrinsicoid_v2 = f['V2'].time_to_peak_ms
     if avg_mdi >= 0.55:
         epi_markers += 1
     if avg_pseudo >= 34:
         epi_markers += 1
-    if f['V2'].time_to_peak_ms >= 85:
+    if intrinsicoid_v2 >= 85:
         epi_markers += 1
     if epi_markers >= 2:
         is_epicardial = True
         p['LV'] *= 2.0
-        reasoning.append(f"Epicardial markers ({epi_markers}/3) present → LV epicardial boost")
+        reasoning.append(
+            f"Epicardial markers ({epi_markers}/3): "
+            f"MDI={avg_mdi:.2f}, pseudo-δ={avg_pseudo:.0f} ms, "
+            f"intrinsicoid-V2={intrinsicoid_v2:.0f} ms → LV epicardial boost"
+        )
 
     # V2 pattern break → strong LV summit signature
     if cf.v2_pattern_break:
@@ -403,7 +565,7 @@ def classify_4regions(
     most_likely = max(p, key=p.get)
     confidence = p[most_likely]
 
-    # ═══════ Sub-localization hint ═══════
+    # ═══════ Sub-localization hint (matches PDF page 27 quick-reference table) ═══════
     sub = ''
     if most_likely == 'RVOT':
         if f['I'].polarity == 'positive' and f['V1'].notch_count <= 2:
@@ -411,24 +573,28 @@ def classify_4regions(
         else:
             sub = 'RVOT free wall'
     elif most_likely == 'LVOT':
-        if f['V1'].notch_count >= 3:
-            sub = 'LCC (M/W pattern)'
+        if cf.v1_pattern == 'M/W':
+            sub = 'LCC — Left Coronary Cusp (M/W in V1)'
+        elif cf.v1_pattern == 'qrS':
+            sub = 'L-R Commissure (qrS in V1)'
         elif tz <= 2:
-            sub = 'RCC'
+            sub = f'RCC — Right Coronary Cusp (early V{tz} transition)'
         else:
-            sub = 'LVOT (cusp)'
+            sub = 'LVOT (cusp, indeterminate)'
     elif most_likely == 'LV':
         if cf.v2_pattern_break:
-            sub = 'LV Summit (epicardial)'
+            sub = 'LV Summit (epicardial — V2 pattern break)'
         elif is_epicardial:
             sub = 'LV epicardial'
+        elif cf.v1_pattern == 'narrow-RBBB':
+            sub = 'LV fascicular (posterior fascicle VT)'
         elif cf.inferior_axis_score < -0.3:
-            sub = 'LV papillary muscle'
+            sub = 'LV papillary muscle / inferior wall'
         else:
             sub = 'LV body'
     else:  # RV
         if cf.inferior_axis_score < -0.3:
-            sub = 'RV apex / inferior'
+            sub = 'RV apex / inferior wall'
         else:
             sub = 'RV free wall'
 
@@ -438,6 +604,10 @@ def classify_4regions(
         confidence=confidence,
         sub_localization=sub,
         is_epicardial=is_epicardial,
+        epi_marker_count=epi_markers,
+        avg_mdi=float(avg_mdi),
+        avg_pseudo_delta_ms=float(avg_pseudo),
+        intrinsicoid_v2_ms=float(intrinsicoid_v2),
         reasoning=reasoning,
         lead_features=lead_feats,
         cross_features=cf,
@@ -453,20 +623,21 @@ def localize_pvc_12lead(
     visualize: bool = True,
     output_path: str = '12lead_localization.png',
     qrs_window: Optional[Tuple[int, int, int]] = None,
+    sinus_signal_12ch: Optional[np.ndarray] = None,
 ) -> LocalizationResult:
     """
     Localize a PVC origin from a 12-lead ECG signal.
 
     Args:
-      signal_12ch: array of shape (T, 12). Channels MUST be in order:
-                   I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6
-      fs:          sampling frequency in Hz
-      visualize:   render a 12-panel diagnostic figure
-      output_path: where to save the figure
-      qrs_window:  optional (onset, peak, offset) sample indices. If supplied
-                   (e.g., from PaSo's WOI), skip auto-detection and use these
-                   bounds for feature extraction. Trust externally-segmented
-                   QRS over the multi-lead energy heuristic.
+      signal_12ch:       (T, 12) array in order: I, II, III, aVR, aVL, aVF, V1..V6
+      fs:                sampling frequency in Hz
+      visualize:         render a 12-panel diagnostic figure
+      output_path:       where to save the figure
+      qrs_window:        optional (onset, peak, offset) from PaSo WOI — skips
+                         auto-detection and uses externally-segmented bounds
+      sinus_signal_12ch: optional (W, 12) window of a neighboring sinus beat.
+                         When supplied, enables the proper Betensky V2 transition
+                         ratio (PVC/sinus) and Yoshida TZ index (PVC TZ − sinus TZ).
 
     Returns: LocalizationResult with probabilities, most_likely, sub-loc, reasoning.
     """
@@ -486,8 +657,24 @@ def localize_pvc_12lead(
         lf = extract_lead_features(signal_12ch[:, i], name, onset, peak, offset, fs)
         lead_feats.append(lf)
 
+    # Step 2b: V1 morphology pattern (needs raw signal + QRS bounds)
+    v1_pattern = classify_v1_pattern(
+        signal_12ch[:, LEAD_INDEX['V1']], onset, offset, fs
+    )
+
+    # Step 2c: Sinus reference features (for normalized V2 ratio and TZ index)
+    sinus_feats: Optional[List[LeadFeatures]] = None
+    if sinus_signal_12ch is not None and sinus_signal_12ch.shape[1] == 12:
+        s_onset, s_peak, s_offset = detect_qrs_window_multilead(sinus_signal_12ch, fs)
+        sinus_feats = [
+            extract_lead_features(
+                sinus_signal_12ch[:, i], name, s_onset, s_peak, s_offset, fs
+            )
+            for i, name in enumerate(LEAD_ORDER)
+        ]
+
     # Step 3: Cross-lead features
-    cf = compute_cross_features(lead_feats)
+    cf = compute_cross_features(lead_feats, v1_pattern=v1_pattern, sinus_feats=sinus_feats)
 
     # Step 4: 4-region classification
     result = classify_4regions(lead_feats, cf)
@@ -577,13 +764,20 @@ def visualize_12lead(
     ax_result.text(0.02, 0.95, title, fontsize=14, color='#FFD700',
                     fontweight='bold', va='top', transform=ax_result.transAxes)
 
+    has_sinus = cf.v2_transition_ratio_normalized > 0
+    v2_norm_str = f"{cf.v2_transition_ratio_normalized:.2f}" if has_sinus else "--"
+    tz_str      = f"{cf.tz_index:+.0f}" if has_sinus else "--"
     cross_text = (
         f"Cross-lead features:\n"
+        f"  V1 pattern:             {cf.v1_pattern}\n"
         f"  Frontal axis:           {cf.frontal_axis_deg:+.0f}°\n"
         f"  Inferior axis score:    {cf.inferior_axis_score:+.2f}\n"
         f"  Precordial transition:  V{cf.precordial_transition}\n"
-        f"  V2 transition ratio:    {cf.v2_transition_ratio:.2f}  (≥0.6 → LVOT)\n"
+        f"  V2 ratio raw / norm:    {cf.v2_transition_ratio:.2f} / {v2_norm_str}  (≥0.6 → LVOT)\n"
+        f"  TZ index (vs sinus):    {tz_str}  (< 0 → LV side)\n"
         f"  V2S/V3R index:          {cf.v2s_v3r_index:.2f}  (≤1.5 → LVOT)\n"
+        f"  MDI / pseudo-δ / V2i:   {result.avg_mdi:.2f} / "
+        f"{result.avg_pseudo_delta_ms:.0f} ms / {result.intrinsicoid_v2_ms:.0f} ms\n"
         f"  Max QRS duration:       {cf.qrs_duration_ms:.0f} ms\n"
         f"  V2 pattern break:       {cf.v2_pattern_break}"
     )
