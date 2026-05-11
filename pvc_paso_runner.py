@@ -23,11 +23,12 @@ import shutil
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.io as sio
+from scipy.signal import find_peaks as _find_peaks
 
 from pvc_12lead_localizer import (
     LEAD_INDEX,
@@ -177,7 +178,12 @@ def load_paso_mat(mat_path: Path) -> dict:
     woi_start = int(np.asarray(d['WOI_START']).ravel()[0]) if has_woi else None
     woi_end = int(np.asarray(d['WOI_END']).ravel()[0]) if has_woi else None
 
-    is_valid = bool(np.asarray(d['is valid']).ravel()[0]) if 'is valid' in d else False
+    # PaSo files use 'is valid' (with space); guard against key variants
+    is_valid = False
+    for _key in ('is valid', 'is_valid', 'isValid'):
+        if _key in d:
+            is_valid = bool(np.asarray(d[_key]).ravel()[0])
+            break
 
     xyz = None
     if 'XYZ_Position' in d:
@@ -230,6 +236,71 @@ def extract_window(
 
 
 # ─────────────────────────────────────────────────────────────────
+# SINUS BEAT EXTRACTION
+# ─────────────────────────────────────────────────────────────────
+def find_sinus_beat(
+    signal_12ch: np.ndarray,
+    fs: float,
+    pvc_woi_start: int,
+    pvc_woi_end: int,
+    window_ms: float = 400.0,
+) -> Optional[np.ndarray]:
+    """
+    Find a neighboring sinus beat in the full recording to use as reference
+    for the Betensky V2 transition ratio and Yoshida TZ index.
+
+    Strategy: multi-lead energy peak detection → exclude the PVC → pick the
+    closest candidate with the narrowest QRS energy width (sinus beats are
+    narrow relative to PVC beats).
+
+    Returns a (W, 12) windowed sinus beat, or None if no suitable beat found.
+    """
+    T = signal_12ch.shape[0]
+    W = int(round(window_ms * fs / 1000.0))
+    if T <= W:
+        return None
+
+    baselines = np.median(signal_12ch, axis=0)
+    energy = np.sum(np.abs(signal_12ch - baselines), axis=1)
+
+    # Minimum QRS spacing: 300 ms (physiological minimum RR interval)
+    min_dist = max(1, int(0.30 * fs))
+    threshold = 0.25 * float(np.max(energy))
+    peaks, _ = _find_peaks(energy, height=threshold, distance=min_dist)
+
+    if len(peaks) == 0:
+        return None
+
+    # Exclude the PVC (any peak within ±150 ms of the WOI centre)
+    pvc_centre = (pvc_woi_start + pvc_woi_end) // 2
+    margin = int(0.15 * fs)
+    candidates = [
+        p for p in peaks
+        if abs(p - pvc_centre) > margin
+        and (p - W // 2) >= 0
+        and (p + W // 2) < T
+    ]
+    if not candidates:
+        return None
+
+    # Estimate QRS energy width for each candidate (narrow = more likely sinus)
+    def _energy_width(pk: int) -> float:
+        thr = 0.30 * energy[pk]
+        left, right = pk, pk
+        while left > 0 and energy[left] > thr:
+            left -= 1
+        while right < T - 1 and energy[right] > thr:
+            right += 1
+        return float(right - left)
+
+    # Primary sort: narrower width; secondary: closer to PVC (same sinus context)
+    best = min(candidates, key=lambda p: (_energy_width(p), abs(p - pvc_centre)))
+
+    start = max(0, min(best - W // 2, T - W))
+    return signal_12ch[start:start + W]
+
+
+# ─────────────────────────────────────────────────────────────────
 # DRIVER
 # ─────────────────────────────────────────────────────────────────
 def _natural_key(p: Path):
@@ -271,15 +342,29 @@ def process_one(mat_path: Path, fs: float, window_ms: float, out_dir: Path) -> d
         info['signal_12ch'], info['woi_start'], info['woi_end'], fs, window_ms,
     )
 
-    # If PaSo gave us a WOI, translate file-coords → window-coords and pass it
-    # to the localizer so it skips its own QRS detector (which is unreliable
-    # on noisy strips).
+    # If PaSo gave us a WOI, translate file-coords → window-coords.
+    # Use the actual multi-lead energy peak within the WOI bounds as the QRS
+    # peak — more accurate than the WOI midpoint for MDI computation.
     qrs_window = None
     if info['woi_start'] is not None and info['woi_end'] is not None:
         ws = max(0, info['woi_start'] - win_start)
         we = min(window.shape[0] - 1, info['woi_end'] - win_start)
         if 0 <= ws < we < window.shape[0]:
-            qrs_window = (ws, (ws + we) // 2, we)
+            baselines_w = np.median(window, axis=0)
+            energy_w = np.sum(np.abs(window - baselines_w), axis=1)
+            actual_peak = ws + int(np.argmax(energy_w[ws:we + 1]))
+            qrs_window = (ws, actual_peak, we)
+
+    # Extract a neighboring sinus beat from the full file (IS files only) so
+    # the localizer can compute the proper Betensky V2 ratio and Yoshida TZ index.
+    sinus_window: Optional[np.ndarray] = None
+    if info['kind'] == 'IS' and info['woi_start'] is not None:
+        sinus_window = find_sinus_beat(
+            info['signal_12ch'], fs=fs,
+            pvc_woi_start=info['woi_start'],
+            pvc_woi_end=info['woi_end'],
+            window_ms=window_ms,
+        )
 
     png_path = out_dir / f"{stem}_localization.png"
     raw_png_path = out_dir / f"{stem}_raw.png"
@@ -292,12 +377,14 @@ def process_one(mat_path: Path, fs: float, window_ms: float, out_dir: Path) -> d
     result = localize_pvc_12lead(
         window, fs=fs, visualize=True, output_path=str(png_path),
         qrs_window=qrs_window,
+        sinus_signal_12ch=sinus_window,
     )
 
     qrs_dur = None
     if info['woi_start'] is not None and info['woi_end'] is not None:
         qrs_dur = (info['woi_end'] - info['woi_start']) * 1000.0 / fs
 
+    cf = result.cross_features
     return {
         "file": mat_path.name,
         "kind": info['kind'],
@@ -309,15 +396,27 @@ def process_one(mat_path: Path, fs: float, window_ms: float, out_dir: Path) -> d
         "window_start_idx": int(win_start),
         "window_samples": int(window.shape[0]),
         "fs_hz": fs,
+        "sinus_beat_found": sinus_window is not None,
+        # ─── Classification ───
         "predicted_region": result.most_likely,
         "confidence": result.confidence,
         "sub_localization": result.sub_localization,
-        "is_epicardial": result.is_epicardial,
         "probabilities": result.probabilities,
-        "frontal_axis_deg": result.cross_features.frontal_axis_deg,
-        "precordial_transition": result.cross_features.precordial_transition,
-        "v2_transition_ratio": result.cross_features.v2_transition_ratio,
-        "v2s_v3r_index": result.cross_features.v2s_v3r_index,
+        # ─── Epicardial markers (Daniels 2006, Berruezo 2004) ───
+        "is_epicardial": result.is_epicardial,
+        "epi_marker_count": result.epi_marker_count,
+        "avg_mdi": result.avg_mdi,
+        "avg_pseudo_delta_ms": result.avg_pseudo_delta_ms,
+        "intrinsicoid_v2_ms": result.intrinsicoid_v2_ms,
+        # ─── Cross-lead indices ───
+        "v1_pattern": cf.v1_pattern,
+        "frontal_axis_deg": cf.frontal_axis_deg,
+        "precordial_transition": cf.precordial_transition,
+        "v2_transition_ratio": cf.v2_transition_ratio,
+        "v2_transition_ratio_normalized": cf.v2_transition_ratio_normalized,
+        "tz_index": cf.tz_index,
+        "v2s_v3r_index": cf.v2s_v3r_index,
+        # ─── Output files ───
         "png": str(png_path),
         "raw_png": str(raw_png_path),
     }
