@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 
+# PyCharm — IDE settings are machine-local, not project-shared
+.idea/
+
 # Local Claude Code settings
 .claude/
 
