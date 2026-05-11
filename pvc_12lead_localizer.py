@@ -354,12 +354,18 @@ def compute_cross_features(
             inf_score -= (1.0 - f[nm].rs_ratio)
     cf.inferior_axis_score = inf_score / 3.0
 
-    # ─── Precordial transition zone (lead where R first ≥ S) ───
+    # ─── Precordial transition zone (first lead where R≥S, sustained) ───
+    # Require the *next* lead to also be ≥0.5 so a single noisy spike in
+    # V2 (while V1 and V3 are negative) doesn't falsely anchor the transition.
+    _prec = ['V1', 'V2', 'V3', 'V4', 'V5', 'V6']
     transition = 7  # default: never transitions within V1–V6
-    for i, lead in enumerate(['V1', 'V2', 'V3', 'V4', 'V5', 'V6'], start=1):
+    for i, lead in enumerate(_prec, start=1):
         if f[lead].rs_ratio >= 0.5:
-            transition = i
-            break
+            next_lead = _prec[i] if i < len(_prec) else None  # i is 1-based, _prec is 0-based
+            sustained = (next_lead is None) or (f[next_lead].rs_ratio >= 0.5)
+            if sustained:
+                transition = i
+                break
     cf.precordial_transition = transition
 
     # ─── V2 transition ratio raw (Betensky numerator) ───
@@ -374,10 +380,12 @@ def compute_cross_features(
             cf.v2_transition_ratio_normalized = cf.v2_transition_ratio / sinus_v2_rs
         # Yoshida 2011: PVC transition lead − sinus transition lead → <0 = LV side
         sinus_tz = 7
-        for i, lead in enumerate(['V1', 'V2', 'V3', 'V4', 'V5', 'V6'], start=1):
+        for i, lead in enumerate(_prec, start=1):
             if sf[lead].rs_ratio >= 0.5:
-                sinus_tz = i
-                break
+                next_lead = _prec[i] if i < len(_prec) else None
+                if (next_lead is None) or (sf[next_lead].rs_ratio >= 0.5):
+                    sinus_tz = i
+                    break
         cf.tz_index = float(transition - sinus_tz)
 
     # ─── V2S/V3R index (Yoshida 2014) ───
