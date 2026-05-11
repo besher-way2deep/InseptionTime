@@ -1,7 +1,7 @@
 """
 Run PVC origin localization on PaSo (.mat) 12-lead recordings.
 
-Reads `*_paso_ai.mat` files from MY_DATA_FOLDER (read-only), extracts a 400 ms
+Reads `*_paso_ai.mat` files from a PaSo folder (read-only), extracts a 400 ms
 window centered on the file's WOI (Window Of Interest = the PVC QRS that the
 PaSo system already segmented), reorders leads to clinical order, and runs
 the localizer in `pvc_12lead_localizer.py`.
@@ -10,13 +10,18 @@ Source PaSo files are NEVER modified. If you need a local working copy, set
 COPY_LOCALLY=True and files are copied to ./paso_local_copy/.
 
 Usage:
-    py -3 pvc_paso_runner.py                 # process all *_paso_ai.mat
-    py -3 pvc_paso_runner.py IS1             # process one file by stem
-    py -3 pvc_paso_runner.py IS1 PM3 ...     # process several
+    py -3 pvc_paso_runner.py <folder>                  # process all *_paso_ai.mat in folder
+    py -3 pvc_paso_runner.py <folder> IS1              # process one file by stem
+    py -3 pvc_paso_runner.py <folder> IS1 PM3 ...      # process several
+    py -3 pvc_paso_runner.py <folder> --out <dir>      # custom output directory
+
+If <folder> is omitted the script falls back to the DEFAULT_DATA_FOLDER
+constant below (kept for backward compatibility).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -114,7 +119,9 @@ def plot_raw_clinical_12lead(
 # ─────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────
-MY_DATA_FOLDER = Path(
+
+# Fallback folder used when no folder is given on the command line.
+DEFAULT_DATA_FOLDER = Path(
     r"C:\Users\MohammadBeshar\Way2Deep\JJ Projects - Documents"
     r"\PVC_Project\W2D_Format\PASO_AI_9__s42_Study_S42_S1714556920\PaSo"
 )
@@ -127,9 +134,6 @@ SAMPLING_RATE_HZ = 1000.0
 
 # 400 ms window — matches the InceptionTime model input length when fs=1000 Hz.
 WINDOW_MS = 400.0
-
-# Output folder for per-file PNGs + a combined JSON summary.
-OUTPUT_DIR = Path("paso_localization_output")
 
 # Optional: copy each .mat into a local working dir before processing.
 # Source files are never modified either way — this is purely if you want
@@ -432,27 +436,48 @@ def process_one(mat_path: Path, fs: float, window_ms: float, out_dir: Path) -> d
 
 
 def main(argv: List[str]) -> int:
-    if not MY_DATA_FOLDER.exists():
-        print(f"Data folder not found: {MY_DATA_FOLDER}")
+    parser = argparse.ArgumentParser(
+        description="Run PVC origin localization on PaSo (*_paso_ai.mat) files."
+    )
+    parser.add_argument(
+        "folder", nargs="?", default=None,
+        help="Path to the PaSo folder containing *_paso_ai.mat files. "
+             "Defaults to DEFAULT_DATA_FOLDER if omitted.",
+    )
+    parser.add_argument(
+        "stems", nargs="*",
+        help="Optional file stems to process (e.g. IS1 PM3). "
+             "Processes all *_paso_ai.mat files if omitted.",
+    )
+    parser.add_argument(
+        "--out", default="paso_localization_output",
+        help="Output directory for PNGs and summary.json (default: paso_localization_output).",
+    )
+    args = parser.parse_args(argv[1:])
+
+    data_folder = Path(args.folder) if args.folder else DEFAULT_DATA_FOLDER
+    out_dir = Path(args.out)
+
+    if not data_folder.exists():
+        print(f"Data folder not found: {data_folder}")
         return 1
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    stems = argv[1:]
-    files = discover_files(MY_DATA_FOLDER, stems)
+    out_dir.mkdir(exist_ok=True)
+    files = discover_files(data_folder, args.stems)
     if not files:
         print("No files to process.")
         return 1
 
     print(f"Processing {len(files)} file(s) at fs={SAMPLING_RATE_HZ:.0f} Hz, "
           f"window={WINDOW_MS:.0f} ms ({int(WINDOW_MS * SAMPLING_RATE_HZ / 1000)} samples)")
-    print(f"Source folder (read-only): {MY_DATA_FOLDER}")
-    print(f"Output folder: {OUTPUT_DIR.resolve()}")
+    print(f"Source folder (read-only): {data_folder}")
+    print(f"Output folder: {out_dir.resolve()}")
 
     summaries = []
     for src in files:
         path = maybe_copy(src)
         try:
-            row = process_one(path, SAMPLING_RATE_HZ, WINDOW_MS, OUTPUT_DIR)
+            row = process_one(path, SAMPLING_RATE_HZ, WINDOW_MS, out_dir)
         except Exception as e:
             print(f"  [{src.name}] ERROR: {e}")
             continue
@@ -461,7 +486,7 @@ def main(argv: List[str]) -> int:
         print(f"  [{src.stem}] {row['predicted_region']:<5} "
               f"({row['confidence']:.0%})  [{row['sub_localization']}]   {probs}")
 
-    summary_path = OUTPUT_DIR / "summary.json"
+    summary_path = out_dir / "summary.json"
     with open(summary_path, "w") as f:
         json.dump(summaries, f, indent=2)
     print(f"\nWrote {len(summaries)} result(s) -> {summary_path}")
