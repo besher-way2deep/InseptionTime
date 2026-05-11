@@ -246,12 +246,19 @@ def find_sinus_beat(
     window_ms: float = 400.0,
 ) -> Optional[np.ndarray]:
     """
-    Find a neighboring sinus beat in the full recording to use as reference
-    for the Betensky V2 transition ratio and Yoshida TZ index.
+    Find one good sinus beat in the full recording to use as reference for the
+    Betensky V2 transition ratio and Yoshida TZ index.
 
-    Strategy: multi-lead energy peak detection → exclude the PVC → pick the
-    closest candidate with the narrowest QRS energy width (sinus beats are
-    narrow relative to PVC beats).
+    Strategy:
+      1. Detect all beats via multi-lead energy peaks.
+      2. Compute all RR intervals and find the dominant (modal) RR — the most
+         common inter-beat interval, which corresponds to the sinus rate even
+         in recordings with frequent PVCs or bigeminy.
+      3. Keep only beats whose preceding AND following RR both match the modal
+         RR within ±15 % — this ensures the candidate sits inside a stable
+         sinus run, not immediately after a compensatory pause or before a PVC.
+      4. From those candidates pick the one closest to the PVC (same recording
+         context / hemodynamic state).
 
     Returns a (W, 12) windowed sinus beat, or None if no suitable beat found.
     """
@@ -263,39 +270,41 @@ def find_sinus_beat(
     baselines = np.median(signal_12ch, axis=0)
     energy = np.sum(np.abs(signal_12ch - baselines), axis=1)
 
-    # Minimum QRS spacing: 300 ms (physiological minimum RR interval)
     min_dist = max(1, int(0.30 * fs))
     threshold = 0.25 * float(np.max(energy))
     peaks, _ = _find_peaks(energy, height=threshold, distance=min_dist)
 
-    if len(peaks) == 0:
+    if len(peaks) < 3:
         return None
 
-    # Exclude the PVC (any peak within ±150 ms of the WOI centre)
+    # ── Step 1: find the dominant (modal) RR interval ──────────────
+    rr = np.diff(peaks.astype(np.float32))          # N-1 intervals
+    # Bin RR values in 50 ms buckets; the most populated bucket = sinus rate
+    bin_ms = 50
+    bins = np.arange(0, rr.max() + bin_ms, bin_ms)
+    counts, edges = np.histogram(rr, bins=bins)
+    modal_rr = float(edges[np.argmax(counts)] + bin_ms / 2)  # bin centre
+
+    # ── Step 2: keep beats with stable RR on both sides ────────────
+    tolerance = 0.15 * modal_rr
     pvc_centre = (pvc_woi_start + pvc_woi_end) // 2
-    margin = int(0.15 * fs)
-    candidates = [
-        p for p in peaks
-        if abs(p - pvc_centre) > margin
-        and (p - W // 2) >= 0
-        and (p + W // 2) < T
-    ]
+
+    candidates = []
+    for i in range(1, len(peaks) - 1):
+        rr_before = float(peaks[i] - peaks[i - 1])
+        rr_after  = float(peaks[i + 1] - peaks[i])
+        if (abs(rr_before - modal_rr) <= tolerance
+                and abs(rr_after - modal_rr) <= tolerance
+                and abs(peaks[i] - pvc_centre) > modal_rr   # at least 1 RR away
+                and (peaks[i] - W // 2) >= 0
+                and (peaks[i] + W // 2) < T):
+            candidates.append(peaks[i])
+
     if not candidates:
         return None
 
-    # Estimate QRS energy width for each candidate (narrow = more likely sinus)
-    def _energy_width(pk: int) -> float:
-        thr = 0.30 * energy[pk]
-        left, right = pk, pk
-        while left > 0 and energy[left] > thr:
-            left -= 1
-        while right < T - 1 and energy[right] > thr:
-            right += 1
-        return float(right - left)
-
-    # Primary sort: narrower width; secondary: closer to PVC (same sinus context)
-    best = min(candidates, key=lambda p: (_energy_width(p), abs(p - pvc_centre)))
-
+    # ── Step 3: pick the candidate closest to the PVC ──────────────
+    best = min(candidates, key=lambda p: abs(p - pvc_centre))
     start = max(0, min(best - W // 2, T - W))
     return signal_12ch[start:start + W]
 
