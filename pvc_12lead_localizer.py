@@ -376,8 +376,13 @@ def compute_cross_features(
         sf = {lf.name: lf for lf in sinus_feats}
         sinus_v2_rs = sf['V2'].rs_ratio
         # Betensky 2011: PVC R/(R+S) in V2 ÷ sinus R/(R+S) in V2 → ≥0.6 = LVOT
+        # Cap at 3.0: when sinus V2 is near-zero (rS/QS pattern), the raw ratio
+        # explodes but anything above 2.0 already means "clearly more positive than
+        # sinus" — no additional clinical information above that ceiling.
         if sinus_v2_rs > 0.01:
-            cf.v2_transition_ratio_normalized = cf.v2_transition_ratio / sinus_v2_rs
+            cf.v2_transition_ratio_normalized = min(
+                cf.v2_transition_ratio / sinus_v2_rs, 3.0
+            )
         # Yoshida 2011: PVC transition lead − sinus transition lead → <0 = LV side
         sinus_tz = 7
         for i, lead in enumerate(_prec, start=1):
